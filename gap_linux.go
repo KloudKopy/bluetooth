@@ -58,7 +58,6 @@ func (a *Advertisement) Configure(concurrentAdv bool, options AdvertisementOptio
 		return errAdvertisementAlreadyStarted
 	}
 
-	// --- Prepare data ---
 	serviceUUIDs := make([]string, len(options.ServiceUUIDs))
 	for i, uuid := range options.ServiceUUIDs {
 		serviceUUIDs[i] = uuid.String()
@@ -140,83 +139,25 @@ func (a *Advertisement) Configure(concurrentAdv bool, options AdvertisementOptio
 			extendedRegistered.Store(true)
 		}
 
-		// Keep references to clean up later
 		a.path = legacyPath
 		a.properties = props
 		a.extendedPath = extendedPath
 		a.extendedProperties = propsExt
 	}
-
-	// Initial registration
 	register()
 
+	// HACK: There is currently no way to check for discovery state via d-bus as of bluez 5.72
 	if concurrentAdv {
-		// Periodically retry registrations
 		ticker := time.NewTicker(5 * time.Second)
 		go func() {
 			for range ticker.C {
 				register()
 			}
 		}()
-
-		// Watch for new devices to re-register advertisements
-		watchConnections(a.adapter.bus, register)
 	}
 
 	a.started = true
 	return nil
-}
-
-func watchConnections(bus *dbus.Conn, register func()) {
-	addMatch := func(rule string) {
-		call := bus.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule)
-		if call.Err != nil {
-			fmt.Println("Failed to add D-Bus match:", call.Err)
-		}
-	}
-
-	addMatch("type='signal',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded',sender='org.bluez'")
-
-	c := make(chan *dbus.Signal, 20)
-	bus.Signal(c)
-
-	knownDevices := make(map[string]bool)
-
-	go func() {
-		for sig := range c {
-			if sig.Name != "org.freedesktop.DBus.ObjectManager.InterfacesAdded" {
-				continue
-			}
-			if len(sig.Body) < 2 {
-				continue
-			}
-
-			path, ok := sig.Body[0].(dbus.ObjectPath)
-			if !ok {
-				continue
-			}
-
-			// Extract just the dev_XX_XX_XX_XX_XX_XX portion
-			parts := strings.Split(string(path), "/")
-			var devPath string
-			for _, p := range parts {
-				if strings.HasPrefix(p, "dev_") {
-					devPath = "/org/bluez/hci0/" + p
-					break
-				}
-			}
-			if devPath == "" {
-				continue
-			}
-
-			if !knownDevices[devPath] {
-				knownDevices[devPath] = true
-				fmt.Println("New device detected:", devPath)
-				fmt.Println("Re-registering advertisements...")
-				register()
-			}
-		}
-	}()
 }
 
 func (a *Advertisement) Start() error {
