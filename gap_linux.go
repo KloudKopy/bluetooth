@@ -151,6 +151,20 @@ func (a *Advertisement) Configure(concurrentAdv bool, options AdvertisementOptio
 		ticker := time.NewTicker(5 * time.Second)
 		go func() {
 			for range ticker.C {
+				advManagerObj := a.adapter.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez/hci0"))
+
+				if a.path != "" {
+					_ = advManagerObj.Call("org.bluez.LEAdvertisingManager1.UnregisterAdvertisement", 0, a.path).Err
+					a.path = ""
+					a.properties = nil
+				}
+
+				if a.extendedPath != "" {
+					_ = advManagerObj.Call("org.bluez.LEAdvertisingManager1.UnregisterAdvertisement", 0, a.extendedPath).Err
+					a.extendedPath = ""
+					a.extendedProperties = nil
+				}
+
 				register()
 			}
 		}()
