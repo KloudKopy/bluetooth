@@ -7,47 +7,14 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/godbus/dbus/v5/prop"
 )
 
-const (
-	// Match rule constants for D-Bus signals.
-	//
-	// See [DBusPropertiesLink] for more information.
-
-	dbusPropertiesChangedInterfaceName = 0
-	dbusPropertiesChangedDictionary    = 1
-	dbusPropertiesChangedInvalidated   = 2
-
-	dbusInterfacesAddedDictionary = 1
-
-	dbusSignalInterfacesAdded   = "org.freedesktop.DBus.ObjectManager.InterfacesAdded"
-	dbusSignalPropertiesChanged = "org.freedesktop.DBus.Properties.PropertiesChanged"
-
-	bluezDevice1Interface = "org.bluez.Device1"
-	bluezDevice1Address   = "Address"
-	bluezDevice1Connected = "Connected"
-)
-
-var (
-	// See [DBusPropertiesLink] for more information.
-	matchOptionsPropertiesChanged = []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.Properties"),
-		dbus.WithMatchMember("PropertiesChanged"),
-		dbus.WithMatchArg(dbusPropertiesChangedInterfaceName, "org.bluez.Device1")}
-
-	// See [DBusObjectManagerLink] for more information.
-	matchOptionsInterfacesAdded = []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.ObjectManager"),
-		dbus.WithMatchMember("InterfacesAdded")}
-)
-
-// [DBusPropertiesLink]: https://dbus.freedesktop.org/doc/dbus-specification.html#standard-interfaces-properties
-// [DBusObjectManagerLink]: https://dbus.freedesktop.org/doc/dbus-specification.html#standard-interfaces-objectmanager
-
 var errAdvertisementNotStarted = errors.New("bluetooth: advertisement is not started")
 var errAdvertisementAlreadyStarted = errors.New("bluetooth: advertisement is already started")
-var errAdaptorNotPowered = errors.New("bluetooth: adaptor is not powered")
 
 // Unique ID per advertisement (to generate a unique object path).
 var advertisementID uint64
@@ -64,8 +31,8 @@ type Advertisement struct {
 	path       dbus.ObjectPath
 	started    bool
 
-	// D-Bus Signals
-	sigCh chan *dbus.Signal
+	extendedPath       dbus.ObjectPath
+	extendedProperties *prop.Properties
 }
 
 // DefaultAdvertisement returns the default advertisement instance but does not
@@ -82,123 +49,210 @@ func (a *Adapter) DefaultAdvertisement() *Advertisement {
 // Configure this advertisement.
 //
 // On Linux with BlueZ, it is not possible to set the advertisement interval.
-func (a *Advertisement) Configure(options AdvertisementOptions) error {
+// // Configure this advertisement.
+// //
+// // On Linux with BlueZ, it is not possible to set the advertisement interval.
+// KloudKopy: The following is a workaround for the lack of Bluez advertisement discovery state via d-bus
+func (a *Advertisement) Configure(concurrentAdv bool, options AdvertisementOptions) error {
 	if a.started {
 		return errAdvertisementAlreadyStarted
 	}
 
-	var serviceUUIDs []string
-	for _, uuid := range options.ServiceUUIDs {
-		serviceUUIDs = append(serviceUUIDs, uuid.String())
+	// --- Prepare data ---
+	serviceUUIDs := make([]string, len(options.ServiceUUIDs))
+	for i, uuid := range options.ServiceUUIDs {
+		serviceUUIDs[i] = uuid.String()
 	}
-	var serviceData = make(map[string]interface{})
+
+	serviceData := make(map[string]interface{})
 	for _, element := range options.ServiceData {
 		serviceData[element.UUID.String()] = element.Data
 	}
 
-	// Convert map[uint16][]byte to map[uint16]any because that's what BlueZ needs.
-	manufacturerData := map[uint16]any{}
+	manufacturerData := make(map[uint16]any)
 	for _, element := range options.ManufacturerData {
 		manufacturerData[element.CompanyID] = element.Data
 	}
 
-	// Build an org.bluez.LEAdvertisement1 object, to be exported over DBus.
-	// See:
-	// https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/org.bluez.LEAdvertisement.rst
-	id := atomic.AddUint64(&advertisementID, 1)
-	a.path = dbus.ObjectPath(fmt.Sprintf("/org/tinygo/bluetooth/advertisement%d", id))
-	propsSpec := map[string]map[string]*prop.Prop{
-		"org.bluez.LEAdvertisement1": {
-			"Type":             {Value: "broadcast"},
-			"ServiceUUIDs":     {Value: serviceUUIDs},
-			"ManufacturerData": {Value: manufacturerData},
-			"LocalName":        {Value: options.LocalName},
-			"ServiceData":      {Value: serviceData, Writable: true},
-			// The documentation states:
-			// > Timeout of the advertisement in seconds. This defines the
-			// > lifetime of the advertisement.
-			// however, the value 0 also works, and presumably means "no
-			// timeout".
-			"Timeout": {Value: uint16(0)},
-			// TODO: MinInterval and MaxInterval (experimental as of BlueZ 5.71)
-		},
-	}
-	props, err := prop.Export(a.adapter.bus, a.path, propsSpec)
-	if err != nil {
-		return err
-	}
-	a.properties = props
+	advManagerObj := a.adapter.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez/hci0"))
 
-	if options.LocalName != "" {
-		// In BlueZ AdvertisementOptions.LocalName will be sent in Extended
-		// Advertising Data and it will not change the Adapter alias.  Setting
-		// this property will update the name in the initial advertising data.
-		call := a.adapter.adapter.Call("org.freedesktop.DBus.Properties.Set", 0,
-			"org.bluez.Adapter1", "Alias", dbus.MakeVariant(options.LocalName))
-		if call.Err != nil {
-			return fmt.Errorf("set adapter alias: %w", call.Err)
-		}
-	}
+	var legacyRegistered, extendedRegistered atomic.Bool
 
-	return nil
-}
+	register := func() {
+		// --- Legacy 1M Advertisement ---
+		legacyID := atomic.AddUint64(&advertisementID, 1)
+		legacyPath := dbus.ObjectPath(fmt.Sprintf("/org/tinygo/bluetooth/legacyAdvertisement%d", legacyID))
 
-// Start advertisement. May only be called after it has been configured.
-func (a *Advertisement) Start() error {
-	// Register our advertisement object to start advertising.
-	err := a.adapter.adapter.Call("org.bluez.LEAdvertisingManager1.RegisterAdvertisement", 0, a.path, map[string]interface{}{}).Err
-	if err != nil {
-		if err, ok := err.(dbus.Error); ok && err.Name == "org.bluez.Error.AlreadyExists" {
-			return errAdvertisementAlreadyStarted
-		}
-		return fmt.Errorf("bluetooth: could not start advertisement: %w", err)
-	}
-
-	if a.adapter.connectHandler != nil {
-		a.sigCh = make(chan *dbus.Signal)
-		a.adapter.bus.Signal(a.sigCh)
-
-		if err := a.adapter.bus.AddMatchSignal(matchOptionsPropertiesChanged...); err != nil {
-			return fmt.Errorf("bluetooth: add dbus match signal: PropertiesChanged: %w", err)
+		legacyProps := map[string]map[string]*prop.Prop{
+			"org.bluez.LEAdvertisement1": {
+				"Type":             {Value: "peripheral"},
+				"ManufacturerData": {Value: manufacturerData},
+				"LocalName":        {Value: options.LocalName},
+				"ServiceUUIDs":     {Value: serviceUUIDs},
+				"ServiceData":      {Value: serviceData, Writable: true},
+				"Timeout":          {Value: uint16(0)},
+				"MaxInterval":      {Value: uint32(200)},
+				"MinInterval":      {Value: uint32(100)},
+			},
 		}
 
-		if err := a.adapter.bus.AddMatchSignal(matchOptionsInterfacesAdded...); err != nil {
-			return fmt.Errorf("bluetooth: add dbus match signal: InterfacesAdded: %w", err)
+		props, err := prop.Export(a.adapter.bus, legacyPath, legacyProps)
+		if err != nil {
+			fmt.Println("failed to export legacy advertisement:", err)
+			return
 		}
 
-		go a.handleDBusSignals()
+		err = advManagerObj.Call("org.bluez.LEAdvertisingManager1.RegisterAdvertisement", 0, legacyPath, map[string]interface{}{}).Err
+		if err != nil && !legacyRegistered.Load() {
+			fmt.Println("Failed to register legacy advertisement:", err)
+		} else if err == nil {
+			legacyRegistered.Store(true)
+		}
+
+		// --- Extended 2M / Coded Advertisement ---
+		extendedID := atomic.AddUint64(&advertisementID, 1)
+		extendedPath := dbus.ObjectPath(fmt.Sprintf("/org/tinygo/bluetooth/extendedAdvertisement%d", extendedID))
+
+		extendedProps := map[string]map[string]*prop.Prop{
+			"org.bluez.LEAdvertisement1": {
+				"Type":             {Value: "peripheral"},
+				"ManufacturerData": {Value: manufacturerData},
+				"ServiceUUIDs":     {Value: serviceUUIDs},
+				"ServiceData":      {Value: serviceData, Writable: true},
+				"LocalName":        {Value: options.LocalName},
+				"Timeout":          {Value: uint16(0)},
+				"MaxInterval":      {Value: uint32(200)},
+				"MinInterval":      {Value: uint32(100)},
+				"SecondaryChannel": {Value: "2M"},
+			},
+		}
+
+		propsExt, err := prop.Export(a.adapter.bus, extendedPath, extendedProps)
+		if err != nil {
+			fmt.Println("failed to export extended advertisement:", err)
+			return
+		}
+
+		err = advManagerObj.Call("org.bluez.LEAdvertisingManager1.RegisterAdvertisement", 0, extendedPath, map[string]interface{}{}).Err
+		if err != nil && !extendedRegistered.Load() {
+			fmt.Println("Failed to register extended advertisement:", err)
+		} else if err == nil {
+			extendedRegistered.Store(true)
+		}
+
+		// Keep references to clean up later
+		a.path = legacyPath
+		a.properties = props
+		a.extendedPath = extendedPath
+		a.extendedProperties = propsExt
 	}
 
-	// Make us discoverable.
-	err = a.adapter.adapter.SetProperty("org.bluez.Adapter1.Discoverable", dbus.MakeVariant(true))
-	if err != nil {
-		return fmt.Errorf("bluetooth: could not start advertisement: %w", err)
+	// Initial registration
+	register()
+
+	if concurrentAdv {
+		// Periodically retry registrations
+		ticker := time.NewTicker(5 * time.Second)
+		go func() {
+			for range ticker.C {
+				register()
+			}
+		}()
+
+		// Watch for new devices to re-register advertisements
+		watchConnections(a.adapter.bus, register)
 	}
+
 	a.started = true
 	return nil
 }
 
-// Stop advertisement. May only be called after it has been started.
-func (a *Advertisement) Stop() error {
-	err := a.adapter.adapter.Call("org.bluez.LEAdvertisingManager1.UnregisterAdvertisement", 0, a.path).Err
-	if err != nil {
-		if err, ok := err.(dbus.Error); ok && err.Name == "org.bluez.Error.DoesNotExist" {
-			return errAdvertisementNotStarted
+func watchConnections(bus *dbus.Conn, register func()) {
+	addMatch := func(rule string) {
+		call := bus.BusObject().Call("org.freedesktop.DBus.AddMatch", 0, rule)
+		if call.Err != nil {
+			fmt.Println("Failed to add D-Bus match:", call.Err)
 		}
-		return fmt.Errorf("bluetooth: could not stop advertisement: %w", err)
 	}
-	a.started = false
 
-	if a.sigCh != nil {
-		defer close(a.sigCh)
-		if err := a.adapter.bus.RemoveMatchSignal(matchOptionsPropertiesChanged...); err != nil {
-			return fmt.Errorf("bluetooth: remove dbus match signal: PropertiesChanged: %w", err)
+	addMatch("type='signal',interface='org.freedesktop.DBus.ObjectManager',member='InterfacesAdded',sender='org.bluez'")
+
+	c := make(chan *dbus.Signal, 20)
+	bus.Signal(c)
+
+	knownDevices := make(map[string]bool)
+
+	go func() {
+		for sig := range c {
+			if sig.Name != "org.freedesktop.DBus.ObjectManager.InterfacesAdded" {
+				continue
+			}
+			if len(sig.Body) < 2 {
+				continue
+			}
+
+			path, ok := sig.Body[0].(dbus.ObjectPath)
+			if !ok {
+				continue
+			}
+
+			// Extract just the dev_XX_XX_XX_XX_XX_XX portion
+			parts := strings.Split(string(path), "/")
+			var devPath string
+			for _, p := range parts {
+				if strings.HasPrefix(p, "dev_") {
+					devPath = "/org/bluez/hci0/" + p
+					break
+				}
+			}
+			if devPath == "" {
+				continue
+			}
+
+			if !knownDevices[devPath] {
+				knownDevices[devPath] = true
+				fmt.Println("New device detected:", devPath)
+				fmt.Println("Re-registering advertisements...")
+				register()
+			}
 		}
-		if err := a.adapter.bus.RemoveMatchSignal(matchOptionsInterfacesAdded...); err != nil {
-			return fmt.Errorf("bluetooth: remove dbus match signal: InterfacesAdded: %w", err)
-		}
-		a.adapter.bus.RemoveSignal(a.sigCh)
+	}()
+}
+
+func (a *Advertisement) Start() error {
+	if !a.started {
+		return fmt.Errorf("advertisement not configured")
 	}
+	// Make us discoverable.
+	// HACK: Removed, bluez adds a default advertisment service from adapter discovarable parameter
+	// err := a.adapter.adapter.SetProperty("org.bluez.Adapter1.Discoverable", dbus.MakeVariant(true))
+	// if err != nil {
+	// 	return fmt.Errorf("bluetooth: could not start advertisement: %w", err)
+	// }
+	a.started = true
+	return nil
+}
+
+func (a *Advertisement) Stop() error {
+	if !a.started {
+		return nil
+	}
+
+	advManagerObj := a.adapter.bus.Object("org.bluez", dbus.ObjectPath("/org/bluez/hci0"))
+
+	if a.path != "" {
+		_ = advManagerObj.Call("org.bluez.LEAdvertisingManager1.UnregisterAdvertisement", 0, a.path).Err
+		a.path = ""
+		a.properties = nil
+	}
+
+	if a.extendedPath != "" {
+		_ = advManagerObj.Call("org.bluez.LEAdvertisingManager1.UnregisterAdvertisement", 0, a.extendedPath).Err
+		a.extendedPath = ""
+		a.extendedProperties = nil
+	}
+
+	a.started = false
 	return nil
 }
 
@@ -215,6 +269,21 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 		return errScanning
 	}
 
+	// Channel that will be closed when the scan is stopped.
+	// Detecting whether the scan is stopped can be done by doing a non-blocking
+	// read from it. If it succeeds, the scan is stopped.
+	cancelChan := make(chan struct{})
+	a.scanCancelChan = cancelChan
+
+	// This appears to be necessary to receive any BLE discovery results at all.
+	defer a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0)
+	err := a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{
+		"Transport": "le",
+	}).Err
+	if err != nil {
+		return err
+	}
+
 	signal := make(chan *dbus.Signal)
 	a.bus.Signal(signal)
 	defer a.bus.RemoveSignal(signal)
@@ -226,30 +295,6 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	newObjectMatchOptions := []dbus.MatchOption{dbus.WithMatchInterface("org.freedesktop.DBus.ObjectManager")}
 	a.bus.AddMatchSignal(newObjectMatchOptions...)
 	defer a.bus.RemoveMatchSignal(newObjectMatchOptions...)
-
-	// Check if the adapter is powered on.
-	powered, err := a.adapter.GetProperty("org.bluez.Adapter1.Powered")
-	if err != nil {
-		return err
-	}
-	if !powered.Value().(bool) {
-		return errAdaptorNotPowered
-	}
-
-	// Channel that will be closed when the scan is stopped.
-	// Detecting whether the scan is stopped can be done by doing a non-blocking
-	// read from it. If it succeeds, the scan is stopped.
-	cancelChan := make(chan struct{})
-	a.scanCancelChan = cancelChan
-
-	// This appears to be necessary to receive any BLE discovery results at all.
-	defer a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0)
-	err = a.adapter.Call("org.bluez.Adapter1.SetDiscoveryFilter", 0, map[string]interface{}{
-		"Transport": "le",
-	}).Err
-	if err != nil {
-		return err
-	}
 
 	// Go through all connected devices and present the connected devices as
 	// scan results. Also save the properties so that the full list of
@@ -282,9 +327,10 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 	}
 
 	// Instruct BlueZ to start discovering.
-	// NOTE: We must call Go here, not Call, because it can block if adapter is
-	// powered off, or was recently powered off.
-	startDiscovery := a.adapter.Go("org.bluez.Adapter1.StartDiscovery", 0, nil)
+	err = a.adapter.Call("org.bluez.Adapter1.StartDiscovery", 0).Err
+	if err != nil {
+		return err
+	}
 
 	for {
 		// Check whether the scan is stopped. This is necessary to avoid a race
@@ -298,12 +344,6 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 		}
 
 		select {
-		case <-startDiscovery.Done:
-			if startDiscovery.Err != nil {
-				close(cancelChan)
-				a.scanCancelChan = nil
-				return startDiscovery.Err
-			}
 		case sig := <-signal:
 			// This channel receives anything that we watch for, so we'll have
 			// to check for signals that are relevant to us.
@@ -319,38 +359,20 @@ func (a *Adapter) Scan(callback func(*Adapter, ScanResult)) error {
 				callback(a, makeScanResult(rawprops))
 			case "org.freedesktop.DBus.Properties.PropertiesChanged":
 				interfaceName := sig.Body[0].(string)
-				switch interfaceName {
-				case "org.bluez.Adapter1":
-					// check power state
-					changes := sig.Body[1].(map[string]dbus.Variant)
-					if powered, ok := changes["Powered"]; ok && !powered.Value().(bool) {
-						// adapter is powered off, stop the scan
-						close(cancelChan)
-						a.scanCancelChan = nil
-						return errAdaptorNotPowered
-					} else if discovering, ok := changes["Discovering"]; ok && !discovering.Value().(bool) {
-						// adapter stopped discovering unexpectedly (e.g. due to external event)
-						close(cancelChan)
-						a.scanCancelChan = nil
-						return errScanStopped
-					}
-
-				case "org.bluez.Device1":
-					changes := sig.Body[1].(map[string]dbus.Variant)
-					device, ok := devices[sig.Path]
-					if !ok {
-						// This shouldn't happen, but protect against it just in
-						// case.
-						continue
-					}
-					for k, v := range changes {
-						device[k] = v
-					}
-					callback(a, makeScanResult(device))
-
-				default:
+				if interfaceName != "org.bluez.Device1" {
 					continue
 				}
+				changes := sig.Body[1].(map[string]dbus.Variant)
+				device, ok := devices[sig.Path]
+				if !ok {
+					// This shouldn't happen, but protect against it just in
+					// case.
+					continue
+				}
+				for k, v := range changes {
+					device[k] = v
+				}
+				callback(a, makeScanResult(device))
 			}
 		case <-cancelChan:
 			continue
@@ -430,7 +452,7 @@ func makeScanResult(props map[string]dbus.Variant) ScanResult {
 	}
 }
 
-// Device is a connection to a remote bluetooth device.
+// Device is a connection to a remote peripheral.
 type Device struct {
 	Address Address // the MAC address of the device
 
@@ -460,14 +482,6 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 	a.bus.AddMatchSignal(propertiesChangedMatchOptions...)
 	defer a.bus.RemoveMatchSignal(propertiesChangedMatchOptions...)
 
-	powered, err := a.adapter.GetProperty("org.bluez.Adapter1.Powered")
-	if err != nil {
-		return Device{}, err
-	}
-	if !powered.Value().(bool) {
-		return Device{}, errAdaptorNotPowered
-	}
-
 	// Read whether this device is already connected.
 	connected, err := device.device.GetProperty("org.bluez.Device1.Connected")
 	if err != nil {
@@ -489,34 +503,20 @@ func (a *Adapter) Connect(address Address, params ConnectionParams) (Device, err
 				switch sig.Name {
 				case "org.freedesktop.DBus.Properties.PropertiesChanged":
 					interfaceName := sig.Body[0].(string)
-					switch interfaceName {
-					case "org.bluez.Adapter1":
-						// check power state
-						changes := sig.Body[1].(map[string]dbus.Variant)
-						for k, v := range changes {
-							if k == "Powered" && !v.Value().(bool) {
-								// adapter is powered off, stop the scan
-								err = errAdaptorNotPowered
-								close(connectChan)
-							}
-						}
-					case "org.bluez.Device1":
-						if sig.Path != device.device.Path() {
-							continue
-						}
-						changes := sig.Body[1].(map[string]dbus.Variant)
-						if connected, ok := changes["Connected"].Value().(bool); ok && connected {
-							close(connectChan)
-						}
+					if interfaceName != "org.bluez.Device1" {
+						continue
+					}
+					if sig.Path != device.device.Path() {
+						continue
+					}
+					changes := sig.Body[1].(map[string]dbus.Variant)
+					if connected, ok := changes["Connected"].Value().(bool); ok && connected {
+						close(connectChan)
 					}
 				}
 			}
 		}()
 		<-connectChan
-
-		if err != nil {
-			return Device{}, err
-		}
 	}
 
 	if a.connectHandler != nil {
@@ -565,93 +565,6 @@ func (a *Adapter) SetRandomAddress(mac MAC) error {
 
 	if err := a.adapter.SetProperty("org.bluez.Adapter1.AddressType", "random"); err != nil {
 		return fmt.Errorf("could not set adapter address type: %w", err)
-	}
-
-	return nil
-}
-
-func (a *Advertisement) handleDBusSignals() {
-	for {
-		select {
-		case sig, ok := <-a.sigCh:
-			if !ok {
-				return // channel closed
-			}
-
-			device := Device{
-				device:  a.adapter.bus.Object("org.bluez", sig.Path),
-				adapter: a.adapter,
-			}
-
-			switch sig.Name {
-			case dbusSignalInterfacesAdded:
-				interfaces := sig.Body[dbusInterfacesAddedDictionary].(map[string]map[string]dbus.Variant)
-
-				// InterfacesAdded signal also contains all known properties so
-				// so we do not need to call org.freedesktop.DBus.Properties.GetAll
-				props, ok := interfaces[bluezDevice1Interface]
-				if !ok {
-					continue
-				}
-
-				if err := device.parseProperties(&props); err != nil {
-					continue
-				}
-
-				if connected, ok := props[bluezDevice1Connected].Value().(bool); ok {
-					a.adapter.connectHandler(device, connected)
-				}
-			case dbusSignalPropertiesChanged:
-				// Skip any signals that are not the Device1 interface.
-				if interfaceName, ok := sig.Body[dbusPropertiesChangedInterfaceName].(string); !ok || interfaceName != bluezDevice1Interface {
-					continue
-				}
-
-				// Get all changed properties and skip any signals that are not
-				// compliant with the Device1 interface.
-				changes, ok := sig.Body[dbusPropertiesChangedDictionary].(map[string]dbus.Variant)
-				if !ok {
-					continue
-				}
-
-				// Call the connect handler if the Connected property has changed.
-				if connected, ok := changes[bluezDevice1Connected].Value().(bool); ok {
-					// The only property received is the changed property "Connected",
-					// so we have to get the other properties from D-Bus.
-					var props map[string]dbus.Variant
-					if err := device.device.Call("org.freedesktop.DBus.Properties.GetAll",
-						0,
-						bluezDevice1Interface).Store(&props); err != nil {
-						continue
-					}
-
-					if err := device.parseProperties(&props); err != nil {
-						continue
-					}
-
-					a.adapter.connectHandler(device, connected)
-				}
-			}
-		}
-	}
-}
-
-// parseProperties will set fields from provided properties
-//
-// For all possible properties see:
-// https://github.com/luetzel/bluez/blob/master/doc/device-api.txt
-func (d *Device) parseProperties(props *map[string]dbus.Variant) error {
-	for prop, v := range *props {
-		switch prop {
-		case bluezDevice1Address:
-			if addrStr, ok := v.Value().(string); ok {
-				mac, err := ParseMAC(addrStr)
-				if err != nil {
-					return fmt.Errorf("ParseMAC: %w", err)
-				}
-				d.Address = Address{MACAddress: MACAddress{MAC: mac}}
-			}
-		}
 	}
 
 	return nil
